@@ -155,14 +155,8 @@ void ConcreteEngine::Compose(Context* ctx) {
   if (!ctx)
     return;
   Composition& comp = ctx->composition();
-  const string active_input = ctx->input().substr(0, ctx->caret_pos());
-  DLOG(INFO) << "active input: " << active_input;
-  comp.Reset(active_input);
-  if (ctx->caret_pos() < ctx->input().length() &&
-      ctx->caret_pos() == comp.GetConfirmedPosition()) {
-    // translate one segment past caret pos.
-    comp.Reset(ctx->input());
-  }
+  // XIME_CARET_PATCH: 整串输入始终参与切分与翻译，候选不受光标位置限制
+  comp.Reset(ctx->input());
   CalculateSegmentation(&comp);
   TranslateSegments(&comp);
   DLOG(INFO) << "composition: [" << comp.GetDebugText() << "]";
@@ -185,10 +179,7 @@ void ConcreteEngine::CalculateSegmentation(Segmentation* segments) {
     // no advancement
     if (start_pos == segments->GetCurrentEndPosition())
       break;
-    // only one segment is allowed past caret pos, which is the segment
-    // immediately after the caret.
-    if (start_pos >= context_->caret_pos())
-      break;
+    // XIME_CARET_PATCH: 不再因 caret 位置提前结束分段
     // move onto the next segment...
     if (!segments->HasFinishedSegmentation())
       segments->Forward();
@@ -284,10 +275,7 @@ void ConcreteEngine::OnSelect(Context* ctx) {
 void ConcreteEngine::ApplySchema(Schema* schema) {
   if (!schema)
     return;
-  // 支持 this->schema() 原位重新加載
-  if (schema != schema_.get()) {
-    schema_.reset(schema);
-  }
+  schema_.reset(schema);
   context_->Clear();
   context_->ClearTransientOptions();
   InitializeComponents();

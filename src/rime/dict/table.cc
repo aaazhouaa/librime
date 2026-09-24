@@ -570,25 +570,64 @@ const double kPenaltyForAmbiguousSyllable = -2.995732274;
 
 bool Table::Query(const SyllableGraph& syll_graph,
                   size_t start_pos,
-                  TableQueryResult* result) {
-  if (!result || !index_ || start_pos >= syll_graph.interpreted_length)
+                  TableQueryResult* result,
+                  size_t min_end_pos) {
+  if (!result)
     return false;
   result->clear();
-  std::queue<pair<size_t, TableQuery>> q;
-  TableQuery initial_state(index_);
-  q.push({start_pos, initial_state});
+  map<int, TableQueryResult> per_start;
+  if (!QueryMulti(syll_graph, {start_pos}, &per_start, min_end_pos))
+    return false;
+  *result = std::move(per_start[start_pos]);
+  return !result->empty();
+}
+
+bool Table::QueryMulti(const SyllableGraph& syll_graph,
+                       const vector<size_t>& start_positions,
+                       map<int, TableQueryResult>* result,
+                       size_t min_end_pos,
+                       size_t min_start_pos) {
+  if (!result || !index_ || start_positions.empty())
+    return false;
+  // 多起点 BFS：队列元素携带来源 start（结果分组键）与当前遍历位置。
+  // min_end_pos == 0 means no lower bound (default); otherwise only
+  // collect entries ending at or beyond it (T9 incremental compose).
+  // min_start_pos > 0 时（T9 增量），advance 只进入 >= min_start_pos
+  // 的位置：从更低位置出发即使走满 3 层索引也到不了新桶区域。
+  struct QueueItem {
+    size_t origin;       // 结果分组的来源 start
+    size_t current_pos;  // BFS 当前位置
+    TableQuery query;
+  };
+  std::queue<QueueItem> q;
+  for (size_t start_pos : start_positions) {
+    if (start_pos >= syll_graph.interpreted_length)
+      continue;
+    if (min_start_pos != 0 && start_pos < min_start_pos)
+      continue;
+    q.push(QueueItem{start_pos, start_pos, TableQuery(index_)});
+  }
+  if (q.empty())
+    return false;
   while (!q.empty()) {
-    size_t current_pos = q.front().first;
-    TableQuery query(q.front().second);
+    QueueItem item(q.front());
     q.pop();
+    size_t current_pos = item.current_pos;
+    TableQuery query(item.query);
     auto index = syll_graph.indices.find(current_pos);
     if (index == syll_graph.indices.end()) {
       continue;
     }
+    // min_end_pos == 0 means no lower bound (default); otherwise only
+    // collect entries ending at or beyond it (T9 incremental compose).
+    bool collect_here = min_end_pos == 0 || current_pos >= min_end_pos;
     if (query.level() == Code::kIndexCodeMaxLength) {
-      TableAccessor accessor(query.Access(-1));
-      if (!accessor.exhausted()) {
-        (*result)[current_pos].push_back(accessor);
+      if (collect_here) {
+        TableAccessor accessor(query.Access(-1));
+        if (!accessor.exhausted()) {
+          (*result)[static_cast<int>(item.origin)][static_cast<int>(current_pos)]
+              .push_back(accessor);
+        }
       }
       continue;
     }
@@ -612,15 +651,19 @@ bool Table::Query(const SyllableGraph& syll_graph,
         bool is_normal_spelling = props->type == kNormalSpelling;
         double delta_quality_len =
             (is_normal_spelling ? 1.0 : 0.0) * (end_pos - current_pos);
-        TableAccessor accessor =
-            query.Access(syll_id, next_credibility, delta_quality_len);
-        if (!accessor.exhausted()) {
-          (*result)[end_pos].push_back(accessor);
+        if (min_end_pos == 0 || end_pos >= min_end_pos) {
+          TableAccessor accessor =
+              query.Access(syll_id, next_credibility, delta_quality_len);
+          if (!accessor.exhausted()) {
+            (*result)[static_cast<int>(item.origin)][static_cast<int>(end_pos)]
+                .push_back(accessor);
+          }
         }
         if (end_pos < syll_graph.interpreted_length &&
+            (min_start_pos == 0 || end_pos >= min_start_pos) &&
             query.Advance(syll_id, next_credibility, delta_quality_len,
                           current_pos)) {
-          q.push({end_pos, query});
+          q.push(QueueItem{item.origin, end_pos, query});
           query.Backdate();
         }
       }

@@ -33,6 +33,32 @@
 
 namespace rime {
 
+// 增量命中/回退诊断日志直出 logcat（glog 未桥接 android log）
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <chrono>
+#define T9_INC_LOG(fmt, ...)                                         \
+  __android_log_print(ANDROID_LOG_INFO, "RimePerf", "[T9Inc] " fmt,   \
+                      ##__VA_ARGS__)
+// 作用域分解计时：析构时输出耗时，用于增量路径的瓶颈归因（只测不控）
+struct T9IncTimer {
+  const char* name;
+  std::chrono::steady_clock::time_point start;
+  explicit T9IncTimer(const char* n)
+      : name(n), start(std::chrono::steady_clock::now()) {}
+  ~T9IncTimer() {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    __android_log_print(ANDROID_LOG_INFO, "RimePerf", "[T9Inc] %s: %lld us",
+                        name, static_cast<long long>(us));
+  }
+};
+#else
+#define T9_INC_LOG(fmt, ...) do { } while (0)
+struct T9IncTimer { explicit T9IncTimer(const char*) {} };
+#endif
+
 namespace {
 
 struct SyllabifyTask {
@@ -100,6 +126,7 @@ class ScriptSyllabifier : public PhraseSyllabifier {
   bool IsCorrection(const Code& code, size_t code_length) const;
 
   const SyllableGraph& syllable_graph() const { return syllable_graph_; }
+  const string& input() const { return input_; }
 
  protected:
   ScriptTranslator* translator_;
@@ -143,6 +170,12 @@ class ScriptTranslation : public Translation {
                      const an<QueryResult>& query_result);
   WordGraph PrepareForMakingSentence(Dictionary* dict,
                                      UserDictionary* user_dict);
+  // 增量：只查新桶（end > old_interpreted）追加进缓存的 inc->graph，
+  // 供 MakeSentence 与 MakeSentences 共用（max_sentences > 1 时
+  // 上游 1.17.0 走多句路径，桶缓存机制必须同样生效，否则增量被绕开）
+  void EnrollIncrementalBuckets(Dictionary* dict,
+                                UserDictionary* user_dict,
+                                size_t old_interpreted);
   an<Sentence> MakeSentence(Dictionary* dict, UserDictionary* user_dict);
   deque<an<Sentence>> MakeSentences(Dictionary* dict,
                                     UserDictionary* user_dict);
@@ -196,6 +229,8 @@ ScriptTranslator::ScriptTranslator(const Ticket& ticket)
       enable_word_completion_ = enable_completion_;
     }
     config->GetInt(name_space_ + "/max_homophones", &max_homophones_);
+    config->GetBool(name_space_ + "/incremental_compose",
+                    &incremental_enabled_);
     poet_.reset(new Poet(language(), config));
     if (an<ConfigList> rules = config->GetList(name_space_ + "/canonicalize")) {
       the<Projection> canonicalizer(new Projection());
@@ -203,6 +238,11 @@ ScriptTranslator::ScriptTranslator(const Ticket& ticket)
         canonicalizer_ = std::move(canonicalizer);
       }
     }
+  }
+  if (incremental_enabled_) {
+    incremental_.reset(new ScriptIncrementalState);
+    // 纠错与 strict_spelling 会引入跨轮不稳的音节图/边属性，禁用增量
+    incremental_->enabled = !enable_correction_ && !strict_spelling_;
   }
   if (enable_correction_) {
     if (auto* corrector = Corrector::Require("corrector")) {
@@ -372,8 +412,16 @@ Spans ScriptSyllabifier::Syllabify(const Phrase* phrase) {
 }
 
 size_t ScriptSyllabifier::BuildSyllableGraph(Prism& prism) {
+  T9IncTimer timer("stage-syllable-graph");
+  // 音节图缓存由 translator（每 session 一份）持有；增量准入在
+  // Syllabifier 内部判定（纯数字 + 无纠错 + 环境指纹），miss 自动全量。
+  SyllableGraphCache* cache = nullptr;
+  if (auto* inc = translator_->incremental_state()) {
+    if (inc->enabled)
+      cache = &inc->syllable_cache;
+  }
   return (size_t)syllabifier_.BuildSyllableGraph(input_, prism,
-                                                 &syllable_graph_);
+                                                 &syllable_graph_, cache);
 }
 
 bool ScriptSyllabifier::IsCorrection(const Code& code,
@@ -463,14 +511,18 @@ bool ScriptTranslation::Evaluate(Dictionary* dict, UserDictionary* user_dict) {
   bool predict_word = translator_->enable_word_completion() &&
                       start_ + consumed == end_of_input_;
 
-  phrase_ =
-      dict->Lookup(syllable_graph, 0, &translator_->blacklist(), predict_word);
-  if (user_dict) {
-    const size_t kUnlimitedDepth = 0;
-    const size_t kNumSyllablesToPredictWord = 4;
-    user_phrase_ =
-        user_dict->Lookup(syllable_graph, 0, kUnlimitedDepth,
-                          predict_word ? kNumSyllablesToPredictWord : 0);
+  {
+    T9IncTimer pos0_timer("stage-eval-pos0");
+    phrase_ =
+        dict->Lookup(syllable_graph, 0, &translator_->blacklist(),
+                     predict_word);
+    if (user_dict) {
+      const size_t kUnlimitedDepth = 0;
+      const size_t kNumSyllablesToPredictWord = 4;
+      user_phrase_ =
+          user_dict->Lookup(syllable_graph, 0, kUnlimitedDepth,
+                            predict_word ? kNumSyllablesToPredictWord : 0);
+    }
   }
   if (!phrase_ && !user_phrase_)
     return false;
@@ -702,35 +754,206 @@ void ScriptTranslation::EnrollEntries(
   }
 }
 
-WordGraph ScriptTranslation::PrepareForMakingSentence(
-    Dictionary* dict,
-    UserDictionary* user_dict) {
-  const int kMaxSyllablesForUserPhraseQuery = 5;
-  const auto& syllable_graph = syllabifier_->syllable_graph();
-  WordGraph graph;
-  for (const auto& x : syllable_graph.edges) {
-    auto& same_start_pos = graph[x.first];
-    if (user_dict) {
-      EnrollEntries(same_start_pos,
-                    user_dict->Lookup(syllable_graph, x.first,
-                                      kMaxSyllablesForUserPhraseQuery));
+// 补全边（kCompletion）随输入尾部变化，其桶不可入跨键缓存
+static bool has_completion_edge(const SyllableGraph& graph) {
+  for (const auto& x : graph.edges) {
+    for (const auto& y : x.second) {
+      for (const auto& s : y.second) {
+        if (s.second.type == kCompletion)
+          return true;
+      }
     }
-    // merge lookup results
-    EnrollEntries(same_start_pos, dict->Lookup(syllable_graph, x.first,
-                                               &translator_->blacklist()));
   }
-  return graph;
+  return false;
+}
+
+// 九键输入特征：纯数字串（用于限定增量回退诊断日志的输出范围）
+static bool IsAllDigitsInput(const string& s) {
+  if (s.empty())
+    return false;
+  for (char c : s) {
+    if (c < '0' || c > '9')
+      return false;
+  }
+  return true;
+}
+
+bool ScriptTranslator::TryBeginIncremental(const string& input,
+                                           UserDictionary* user_dict,
+                                           size_t* old_interpreted) {
+  auto* inc = incremental_.get();
+  const char* miss = nullptr;
+  if (!inc || !inc->enabled) {
+    miss = "disabled";
+  } else if (!inc->has_graph) {
+    miss = "no-cache";
+  } else if (inc->interpreted_length != inc->input.size()) {
+    // 上轮尾部未解释完（存在补全边）时桶缓存含随输入变化的条目
+    miss = "prev-incomplete";
+  } else if (input.size() <= inc->input.size() ||
+             input.compare(0, inc->input.size(), inc->input) != 0) {
+    // 仅接受严格追加（九键逐位输入）；缩短/替换一律全量
+    miss = "not-append";
+  } else {
+    auto* ctx = engine_ ? engine_->context() : nullptr;
+    if (!ctx || ctx->composition_epoch() != inc->composition_epoch) {
+      miss = "epoch";
+    } else if (!dict_ || !dict_->prism() ||
+               inc->dict_checksum != dict_->prism()->dict_file_checksum() ||
+               inc->schema_checksum !=
+                   dict_->prism()->schema_file_checksum()) {
+      miss = "prism";
+    } else if (user_dict &&
+               (uint64_t)user_dict->tick() != inc->user_dict_tick) {
+      miss = "user-dict";
+    } else if (GetPrecedingText(0) != inc->preceding_text) {
+      miss = "preceding";
+    }
+  }
+  if (miss) {
+    // 仅诊断九键场景的回退（字母输入每键都会 miss，不打扰）；
+    // glog 不进 logcat，用 android log 直出（tag 与 [TIMING] 一致）
+    if (IsAllDigitsInput(input))
+      T9_INC_LOG("T9 incremental MISS (%s): '%s'", miss, input.c_str());
+    return false;
+  }
+  *old_interpreted = inc->interpreted_length;
+  T9_INC_LOG("T9 incremental HIT: '%s' -> '%s'", inc->input.c_str(),
+             input.c_str());
+  return true;
+}
+
+void ScriptTranslator::CommitIncremental(const string& input,
+                                         size_t interpreted_length,
+                                         UserDictionary* user_dict,
+                                         const string& preceding_text,
+                                         bool cacheable) {
+  auto* inc = incremental_.get();
+  if (!inc)
+    return;
+  inc->input = input;
+  inc->interpreted_length = interpreted_length;
+  inc->composition_epoch =
+      engine_ ? engine_->context()->composition_epoch() : 0;
+  inc->user_dict_tick = user_dict ? (uint64_t)user_dict->tick() : 0;
+  inc->dict_checksum = dict_ && dict_->prism()
+                           ? dict_->prism()->dict_file_checksum()
+                           : 0;
+  inc->schema_checksum = dict_ && dict_->prism()
+                             ? dict_->prism()->schema_file_checksum()
+                             : 0;
+  inc->preceding_text = preceding_text;
+  inc->has_graph = cacheable;
+  if (!cacheable)
+    inc->lattice.reset();
+}
+
+an<Sentence> ScriptTranslation::MakeSentence(Dictionary* dict,
+                                             UserDictionary* user_dict) {
+  const auto& syllable_graph = syllabifier_->syllable_graph();
+  const size_t interpreted = syllable_graph.interpreted_length;
+  const string preceding = translator_->GetPrecedingText(start_);
+  const string& input = syllabifier_->input();
+
+  auto* inc = translator_->incremental_state();
+  size_t old_interpreted = 0;
+  const bool use_incremental =
+      inc && start_ == 0 &&
+      translator_->TryBeginIncremental(input, user_dict, &old_interpreted);
+  // 本轮图含补全边时桶缓存只能作废（下一轮全量）
+  const bool cacheable = !has_completion_edge(syllable_graph);
+
+  if (use_incremental) {
+    DLOG(INFO) << "T9 incremental MakeSentence: " << old_interpreted
+               << " -> " << interpreted;
+    // 只查新桶（end > old_interpreted），追加进缓存的 WordGraph；
+    // 旧桶（含未满的桶）由缓存复用，其内容与全量重跑一致。
+    EnrollIncrementalBuckets(dict, user_dict, old_interpreted);
+    an<Sentence> sentence;
+    {
+      T9IncTimer t("stage-inc-poet");
+      sentence = poet_->MakeSentenceIncremental(inc->graph, interpreted,
+                                                preceding, inc->lattice);
+      if (!sentence) {
+        // 增量前置校验失败 → 全量回退（inc->graph 已含全部桶）
+        sentence = poet_->MakeSentence(inc->graph, interpreted, preceding,
+                                       &inc->lattice);
+      }
+    }
+    if (sentence) {
+      sentence->Offset(start_);
+      sentence->set_syllabifier(syllabifier_);
+    }
+    translator_->CommitIncremental(input, interpreted, user_dict, preceding,
+                                   cacheable);
+    return sentence;
+  }
+
+  WordGraph graph = PrepareForMakingSentence(dict, user_dict);
+  an<Sentence> sentence;
+  if (inc) {
+    if (cacheable) {
+      sentence = poet_->MakeSentence(graph, interpreted, preceding,
+                                     &inc->lattice);
+      inc->graph = std::move(graph);
+    } else {
+      sentence = poet_->MakeSentence(graph, interpreted, preceding);
+    }
+    translator_->CommitIncremental(input, interpreted, user_dict, preceding,
+                                   cacheable);
+  } else {
+    sentence = poet_->MakeSentence(graph, interpreted, preceding);
+  }
+  if (sentence) {
+    sentence->Offset(start_);
+    sentence->set_syllabifier(syllabifier_);
+  }
+  return sentence;
 }
 
 deque<an<Sentence>> ScriptTranslation::MakeSentences(
     Dictionary* dict,
     UserDictionary* user_dict) {
   const auto& syllable_graph = syllabifier_->syllable_graph();
+  const size_t interpreted = syllable_graph.interpreted_length;
+  const string preceding = translator_->GetPrecedingText(start_);
+  const string& input = syllabifier_->input();
+
+  auto* inc = translator_->incremental_state();
+  size_t old_interpreted = 0;
+  const bool use_incremental =
+      inc && start_ == 0 &&
+      translator_->TryBeginIncremental(input, user_dict, &old_interpreted);
+  // 本轮图含补全边时桶缓存只能作废（下一轮全量）
+  const bool cacheable = !has_completion_edge(syllable_graph);
+
+  if (use_incremental) {
+    // 多句 Poet 算法的 states 列表没有增量接口，但它在缓存图上整体
+    // 重跑仅数 ms；真正的瓶颈（桶查询）已被 EnrollIncrementalBuckets
+    // 的增量 + 窗口剪枝覆盖，与 MakeSentence 共享同一套缓存。
+    EnrollIncrementalBuckets(dict, user_dict, old_interpreted);
+    T9IncTimer t("stage-inc-poet-multi");
+    auto sentences = poet_->MakeSentences(
+        inc->graph, interpreted, preceding,
+        max_sentences_, sentence_cutoff_threshold_);
+    for (auto& sentence : sentences) {
+      sentence->Offset(start_);
+      sentence->set_syllabifier(syllabifier_);
+    }
+    translator_->CommitIncremental(input, interpreted, user_dict, preceding,
+                                   cacheable);
+    return sentences;
+  }
+
   WordGraph graph = PrepareForMakingSentence(dict, user_dict);
-  auto sentences =
-      poet_->MakeSentences(graph, syllable_graph.interpreted_length,
-                           translator_->GetPrecedingText(start_),
-                           max_sentences_, sentence_cutoff_threshold_);
+  if (inc && cacheable)
+    inc->graph = std::move(graph);
+  if (inc)
+    translator_->CommitIncremental(input, interpreted, user_dict, preceding,
+                                   cacheable);
+  auto sentences = poet_->MakeSentences(
+      inc && cacheable ? inc->graph : graph, interpreted, preceding,
+      max_sentences_, sentence_cutoff_threshold_);
   for (auto& sentence : sentences) {
     sentence->Offset(start_);
     sentence->set_syllabifier(syllabifier_);
@@ -738,18 +961,83 @@ deque<an<Sentence>> ScriptTranslation::MakeSentences(
   return sentences;
 }
 
-an<Sentence> ScriptTranslation::MakeSentence(Dictionary* dict,
-                                             UserDictionary* user_dict) {
+// 增量造句/多句共用：只查 end > old_interpreted 的新桶，追加进缓存的
+// inc->graph（旧桶由缓存复用，其内容与全量重跑一致）。
+// user_dict 逐 start 查询按「词长可达窗口」过滤：深度限
+// kMaxSyllablesForUserPhraseQuery 个音节，更远的 start 不可能产生
+// end > old_interpreted 的桶；dict 的 LookupAll 同理按
+// max_span × kIndexCodeMaxLength 剪枝。
+void ScriptTranslation::EnrollIncrementalBuckets(
+    Dictionary* dict,
+    UserDictionary* user_dict,
+    size_t old_interpreted) {
+  const int kMaxSyllablesForUserPhraseQuery = 5;
   const auto& syllable_graph = syllabifier_->syllable_graph();
-  WordGraph graph = PrepareForMakingSentence(dict, user_dict);
-  if (auto sentence =
-          poet_->MakeSentence(graph, syllable_graph.interpreted_length,
-                              translator_->GetPrecedingText(start_))) {
-    sentence->Offset(start_);
-    sentence->set_syllabifier(syllabifier_);
-    return sentence;
+  auto* inc = translator_->incremental_state();
+  if (user_dict) {
+    T9IncTimer t("stage-inc-userdict");
+    size_t max_span = 0;
+    for (const auto& x : syllable_graph.edges) {
+      for (const auto& y : x.second) {
+        if (y.first > x.first && y.first - x.first > max_span)
+          max_span = y.first - x.first;
+      }
+    }
+    const size_t kReach =
+        max_span * kMaxSyllablesForUserPhraseQuery;
+    const size_t min_start =
+        old_interpreted > kReach ? old_interpreted - kReach : 0;
+    for (const auto& x : syllable_graph.edges) {
+      if (min_start != 0 && x.first < min_start)
+        continue;
+      EnrollEntries(inc->graph[x.first],
+                    user_dict->Lookup(syllable_graph, x.first,
+                                      kMaxSyllablesForUserPhraseQuery, 0,
+                                      0.0, old_interpreted + 1));
+    }
   }
-  return nullptr;
+  {
+    T9IncTimer t("stage-inc-dict-lookupall");
+    vector<size_t> starts;
+    starts.reserve(syllable_graph.edges.size());
+    for (const auto& x : syllable_graph.edges)
+      starts.push_back(x.first);
+    auto sys_buckets = dict->LookupAll(syllable_graph, starts,
+                                       &translator_->blacklist(), false,
+                                       old_interpreted + 1);
+    for (auto& kv : sys_buckets)
+      EnrollEntries(inc->graph[kv.first], kv.second);
+  }
+}
+
+// 全量建图（上游 1.17.0 从 MakeSentence 抽出）；这里并入多源查询
+// LookupAll（单次遍历收集全部 start 桶），供 MakeSentence 全量回退与
+// MakeSentences 共用。
+WordGraph ScriptTranslation::PrepareForMakingSentence(
+    Dictionary* dict,
+    UserDictionary* user_dict) {
+  const int kMaxSyllablesForUserPhraseQuery = 5;
+  const auto& syllable_graph = syllabifier_->syllable_graph();
+
+  WordGraph result;
+  if (user_dict) {
+    for (const auto& x : syllable_graph.edges) {
+      EnrollEntries(result[x.first],
+                    user_dict->Lookup(syllable_graph, x.first,
+                                      kMaxSyllablesForUserPhraseQuery));
+    }
+  }
+  {
+    vector<size_t> starts;
+    starts.reserve(syllable_graph.edges.size());
+    for (const auto& x : syllable_graph.edges)
+      starts.push_back(x.first);
+    auto sys_buckets =
+        dict->LookupAll(syllable_graph, starts, &translator_->blacklist());
+    for (auto& kv : sys_buckets)
+      EnrollEntries(result[kv.first], kv.second);
+  }
+  return result;
 }
 
 }  // namespace rime

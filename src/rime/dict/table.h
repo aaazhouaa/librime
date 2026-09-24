@@ -14,13 +14,21 @@
 #include <rime/dict/vocabulary.h>
 #include <rime/dict/string_table.h>
 
-#define RIME_TABLE_UNION(U, V, A, a, B, b)                           \
-  struct U {                                                         \
-    V value;                                                         \
-    const A& a() const { return *reinterpret_cast<const A*>(this); } \
-    const B& b() const { return *reinterpret_cast<const B*>(this); } \
-    A& a() { return *reinterpret_cast<A*>(this); }                   \
-    B& b() { return *reinterpret_cast<B*>(this); }                   \
+#define RIME_TABLE_UNION(U, V, A, a, B, b)      \
+  struct U {                                    \
+    V value;                                    \
+    const A& a() const {                        \
+      return *reinterpret_cast<const A*>(this); \
+    }                                           \
+    const B& b() const {                        \
+      return *reinterpret_cast<const B*>(this); \
+    }                                           \
+    A& a() {                                    \
+      return *reinterpret_cast<A*>(this);       \
+    }                                           \
+    B& b() {                                    \
+      return *reinterpret_cast<B*>(this);       \
+    }                                           \
   }
 
 namespace rime {
@@ -198,7 +206,19 @@ class Table : public MappedFile {
   RIME_DLL TableAccessor QueryPhrases(const Code& code);
   RIME_DLL bool Query(const SyllableGraph& syll_graph,
                       size_t start_pos,
-                      TableQueryResult* result);
+                      TableQueryResult* result,
+                      size_t min_end_pos = 0);
+  // 多起点查询：一次 BFS 覆盖多个 start（共享音节树遍历），
+  // 结果按 start 分组。T9 增量 compose 用它把每键 O(N²) 的
+  // 逐 start 查询降为 O(N)。min_start_pos > 0 时（T9 增量）：
+  // 跳过其下的 start，且 advance 不进入其下的位置——离新桶区域
+  // 超过索引深度可达范围的分支不可能产生待收集的桶。
+  // 不清理 result（调用方负责），可跨表累加。
+  RIME_DLL bool QueryMulti(const SyllableGraph& syll_graph,
+                           const vector<size_t>& start_positions,
+                           map<int, TableQueryResult>* result,
+                           size_t min_end_pos = 0,
+                           size_t min_start_pos = 0);
   RIME_DLL string GetEntryText(const table::Entry& entry);
 
   uint32_t dict_file_checksum() const;

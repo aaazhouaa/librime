@@ -5,6 +5,7 @@
 // 2011-07-05 GONG Chen <chen.sst@gmail.com>
 //
 #include <filesystem>
+#include <algorithm>
 #include <rime/algo/syllabifier.h>
 #include <rime/common.h>
 #include <rime/dict/dictionary.h>
@@ -240,9 +241,10 @@ static void lookup_table(Table* table,
                          const SyllableGraph& syllable_graph,
                          size_t start_pos,
                          bool predict_word,
-                         double initial_credibility) {
+                         double initial_credibility,
+                         size_t min_end_pos = 0) {
   TableQueryResult result;
-  if (!table->Query(syllable_graph, start_pos, &result)) {
+  if (!table->Query(syllable_graph, start_pos, &result, min_end_pos)) {
     return;
   }
   // copy result
@@ -257,6 +259,8 @@ static void lookup_table(Table* table,
               a.extra_code(), 0, syllable_graph, end_pos, predict_word);
           if (!match.success)
             continue;
+          if (min_end_pos != 0 && match.end_pos < min_end_pos)
+            continue;
           size_t matching_code_size = a.index_code().size() + match.depth;
           (*collector)[match.end_pos].AddChunk(
               {table, a.code(), a.entry(), matching_code_size, cr, q});
@@ -268,23 +272,39 @@ static void lookup_table(Table* table,
   }
 }
 
-an<DictEntryCollector> Dictionary::Lookup(const SyllableGraph& syllable_graph,
-                                          size_t start_pos,
-                                          const hash_set<string>* blacklist,
-                                          bool predict_word,
-                                          double initial_credibility) {
-  if (!loaded())
-    return nullptr;
-  auto collector = New<DictEntryCollector>();
-  for (const auto& table : tables_) {
-    if (!table->IsOpen())
-      continue;
-    lookup_table(table.get(), collector.get(), syllable_graph, start_pos,
-                 predict_word, initial_credibility);
+static void collect_chunks(DictEntryCollector* collector,
+                           Table* table,
+                           TableQueryResult& result,
+                           const SyllableGraph& syllable_graph,
+                           bool predict_word,
+                           double initial_credibility,
+                           size_t min_end_pos) {
+  for (auto& v : result) {
+    size_t end_pos = v.first;
+    for (TableAccessor& a : v.second) {
+      double cr = initial_credibility + a.credibility();
+      double q = a.quality_len();
+      if (a.extra_code()) {
+        do {
+          dictionary::CodeMatch match = dictionary::match_extra_code(
+              a.extra_code(), 0, syllable_graph, end_pos, predict_word);
+          if (!match.success)
+            continue;
+          if (min_end_pos != 0 && match.end_pos < min_end_pos)
+            continue;
+          size_t matching_code_size = a.index_code().size() + match.depth;
+          (*collector)[match.end_pos].AddChunk(
+              {table, a.code(), a.entry(), matching_code_size, cr, q});
+        } while (a.Next());
+      } else {
+        (*collector)[end_pos].AddChunk({table, a, cr, q});
+      }
+    }
   }
-  if (collector->empty())
-    return nullptr;
-  // for each group of equal code length, sort it and filter words
+}
+
+static void sort_and_filter(DictEntryCollector* collector,
+                            const hash_set<string>* blacklist) {
   for (auto& v : *collector) {
     v.second.Sort();
     if (blacklist && !blacklist->empty()) {
@@ -293,7 +313,89 @@ an<DictEntryCollector> Dictionary::Lookup(const SyllableGraph& syllable_graph,
       });
     }
   }
+}
+
+an<DictEntryCollector> Dictionary::Lookup(const SyllableGraph& syllable_graph,
+                                          size_t start_pos,
+                                          const hash_set<string>* blacklist,
+                                          bool predict_word,
+                                          double initial_credibility,
+                                          size_t min_end_pos) {
+  if (!loaded())
+    return nullptr;
+  auto collector = New<DictEntryCollector>();
+  for (const auto& table : tables_) {
+    if (!table->IsOpen())
+      continue;
+    lookup_table(table.get(), collector.get(), syllable_graph, start_pos,
+                 predict_word, initial_credibility, min_end_pos);
+  }
+  if (collector->empty())
+    return nullptr;
+  // for each group of equal code length, sort it and filter words
+  sort_and_filter(collector.get(), blacklist);
   return collector;
+}
+
+map<int, an<DictEntryCollector>> Dictionary::LookupAll(
+    const SyllableGraph& syllable_graph,
+    const vector<size_t>& start_positions,
+    const hash_set<string>* blacklist,
+    bool predict_word,
+    size_t min_end_pos) {
+  map<int, an<DictEntryCollector>> result;
+  if (!loaded() || start_positions.empty())
+    return result;
+  // T9 增量（min_end_pos > 0）：新桶只可能由「索引 3 层可达范围」内的
+  // start 产生——3 层每层的边跨度 ≤ 图中观测到的最大跨度。
+  // 据此把 start 窗口和 advance 下限压到新桶附近，避免全图遍历。
+  size_t min_start_pos = 0;
+  vector<size_t> starts = start_positions;
+  if (min_end_pos != 0) {
+    size_t max_span = 0;
+    for (const auto& x : syllable_graph.edges) {
+      for (const auto& y : x.second) {
+        if (y.first > x.first && y.first - x.first > max_span)
+          max_span = y.first - x.first;
+      }
+    }
+    const size_t kReach = max_span * Code::kIndexCodeMaxLength;
+    min_start_pos = min_end_pos > kReach ? min_end_pos - kReach : 0;
+    if (min_start_pos != 0) {
+      starts.erase(std::remove_if(starts.begin(), starts.end(),
+                                  [&](size_t s) {
+                                    return s < min_start_pos;
+                                  }),
+                   starts.end());
+    }
+  }
+  if (starts.empty())
+    return result;
+  // 每表一次多源 BFS（共享音节树遍历），chunk 归属需要表指针，按表收集
+  for (const auto& table : tables_) {
+    if (!table->IsOpen())
+      continue;
+    map<int, TableQueryResult> per_start;
+    if (!table->QueryMulti(syllable_graph, starts, &per_start, min_end_pos,
+                           min_start_pos))
+      continue;
+    for (auto& sv : per_start) {
+      auto& collector = result[sv.first];
+      if (!collector)
+        collector = New<DictEntryCollector>();
+      collect_chunks(collector.get(), table.get(), sv.second, syllable_graph,
+                     predict_word, 0.0, min_end_pos);
+    }
+  }
+  for (auto it = result.begin(); it != result.end();) {
+    if (it->second->empty()) {
+      it = result.erase(it);
+      continue;
+    }
+    sort_and_filter(it->second.get(), blacklist);
+    ++it;
+  }
+  return result;
 }
 
 size_t Dictionary::LookupWords(DictEntryIterator* result,

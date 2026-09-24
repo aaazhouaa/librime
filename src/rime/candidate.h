@@ -35,6 +35,13 @@ class Candidate {
   virtual string comment() const { return string(); }
   // text shown in the preedit area, replacing input string (optional)
   virtual string preedit() const { return string(); }
+  // 装饰型包装的解包协议：返回被包装的原始候选；非包装类返回 nullptr。
+  // GetGenuineCandidate 在 Shadow/Uniquified 之外经此解包，使既非 Shadow
+  // 也非 Uniquified 的包装类（如 T9 的 preedit 转换包装，须保持
+  // SimpleCandidate 继承以兼容 Lua 绑定的 dynamic_cast）也能透传
+  // 底层 Phrase——删词（Memory::OnDeleteEntry）依赖 genuine 候选。
+  // 实现约定：必须返回被包装对象且不得成环（UnwrapGenuineProtocol 循环解包）。
+  virtual an<Candidate> genuine() const { return nullptr; }
 
   void set_type(const string& type) { type_ = type; }
   void set_start(size_t start) { start_ = start; }
