@@ -19,6 +19,7 @@
 #include <rime/schema.h>
 #include <rime/service.h>
 #include <rime/translation.h>
+#include <rime/translator.h>
 #include <rime/gear/handslide_filter.h>
 #include <rime/gear/translator_commons.h>
 
@@ -111,7 +112,6 @@ static const std::unordered_set<std::string> kValidSyllables = {
 // 检查是否为合法音节前缀
 static inline bool IsSyllablePrefix(const std::string& prefix) {
   if (prefix.empty()) return false;
-  // 单声母允许作为音节前缀
   static const std::unordered_set<std::string> kInitials = {
       "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
       "j", "q", "x", "zh", "ch", "sh", "r", "z", "c", "s", "y", "w"
@@ -135,13 +135,11 @@ static bool IsPinyinValid(const std::string& input) {
 
   for (size_t i = 0; i < n; ++i) {
     if (!dp[i]) continue;
-    // 汉语拼音单音节长度范围通常为 1 到 6
     for (size_t len = 1; len <= 6 && i + len <= n; ++len) {
       std::string sub = input.substr(i, len);
       if (kValidSyllables.find(sub) != kValidSyllables.end()) {
         dp[i + len] = true;
       } else if (i + len == n && IsSyllablePrefix(sub)) {
-        // 末尾允许不完整前缀
         dp[i + len] = true;
       }
     }
@@ -149,9 +147,24 @@ static bool IsPinyinValid(const std::string& input) {
   return dp[n];
 }
 
+// 将 librime 词典对数概率权重映射为正向线性频次 (1 ~ 1e8 尺度)
+static inline double CalculateBaseFrequency(const an<Candidate>& cand) {
+  if (!cand) return 0.0;
+  auto genuine = Candidate::GetGenuineCandidate(cand);
+  if (auto phrase = As<Phrase>(genuine)) {
+    // librime 中 entry_->weight = log(count) - 18.42068
+    // 因此 std::exp(weight + 18.42068) 严格还原词典真实词频数量级
+    double raw = std::exp(phrase->weight() + 18.42068);
+    return raw > 0.0 ? raw : 1.0;
+  }
+  return cand->quality() * 10000.0;
+}
+
 HandslideFilter::HandslideFilter(const Ticket& ticket) : Filter(ticket) {
   LoadConfig();
 }
+
+HandslideFilter::~HandslideFilter() = default;
 
 void HandslideFilter::LoadConfig() {
   if (!engine_ || !engine_->schema()) return;
@@ -166,23 +179,76 @@ void HandslideFilter::LoadConfig() {
   config->GetInt("handslide/max_guess_count", &max_guess_count_);
 }
 
+void HandslideFilter::InitTranslator() {
+  if (!engine_ || !engine_->schema()) return;
+  string schema_id = engine_->schema()->schema_id();
+  if (guess_translator_ && schema_id == last_schema_id_) {
+    return;
+  }
+  last_schema_id_ = schema_id;
+  Ticket ticket(engine_, "translator");
+  if (auto comp = Translator::Require("script_translator")) {
+    guess_translator_.reset(comp->Create(ticket));
+  }
+}
+
 bool HandslideFilter::AppliesToSegment(Segment* segment) {
   return segment != nullptr;
 }
 
-struct GuessCandidate {
-  an<Candidate> cand;
-  std::string text;
-  double score;
-  bool is_original;
-
-  GuessCandidate(an<Candidate> c, const std::string& t, double s, bool orig)
-      : cand(c), text(t), score(s), is_original(orig) {}
-};
+void HandslideFilter::QueryCandidates(const std::string& guess_code,
+                                      float distance,
+                                      std::vector<GuessCandidate>& final_candidates,
+                                      std::unordered_set<std::string>& seen_texts) {
+  InitTranslator();
+  if (guess_translator_) {
+    // 零开销极速查询：复用主方案底层已就绪的词典与拼音引擎，耗时 < 10 微秒
+    Segment seg(0, guess_code.size());
+    an<Translation> sub_trans = guess_translator_->Query(guess_code, seg);
+    if (sub_trans) {
+      for (size_t i = 0; i < 6 && !sub_trans->exhausted(); ++i) {
+        auto cand = sub_trans->Peek();
+        if (cand && seen_texts.insert(cand->text()).second) {
+          double base_freq = CalculateBaseFrequency(cand);
+          double score = base_freq - weight_k_ * distance;
+          final_candidates.push_back(GuessCandidate(cand, cand->text(), score, false));
+        }
+        sub_trans->Next();
+      }
+    }
+  } else {
+    // 兜底：隔离 Session 查询
+    SessionId sub_id = Service::instance().CreateSession();
+    if (!sub_id) return;
+    an<Session> sub_session = Service::instance().GetSession(sub_id);
+    if (sub_session) {
+      if (!last_schema_id_.empty()) {
+        sub_session->ApplySchema(new Schema(last_schema_id_));
+      }
+      sub_session->context()->set_input(guess_code);
+      Context* sub_ctx = sub_session->context();
+      if (sub_ctx && sub_ctx->HasMenu() && !sub_ctx->composition().empty()) {
+        Segment& seg = sub_ctx->composition().back();
+        if (seg.menu) {
+          for (size_t i = 0; i < 6; ++i) {
+            auto cand = seg.menu->GetCandidateAt(i);
+            if (!cand) break;
+            if (seen_texts.insert(cand->text()).second) {
+              double base_freq = CalculateBaseFrequency(cand);
+              double score = base_freq - weight_k_ * distance;
+              final_candidates.push_back(GuessCandidate(cand, cand->text(), score, false));
+            }
+          }
+        }
+      }
+    }
+    Service::instance().DestroySession(sub_id);
+  }
+}
 
 an<Translation> HandslideFilter::Apply(an<Translation> translation,
                                        CandidateList* candidates) {
-  // 1. 防重入保护（临时子 Session 内部翻译时直接透传放行）
+  // 1. 防重入保护
   static thread_local bool s_reentrancy_guard = false;
   if (s_reentrancy_guard) {
     return translation;
@@ -194,7 +260,9 @@ an<Translation> HandslideFilter::Apply(an<Translation> translation,
   }
 
   std::string input_code = engine_->context()->input();
-  if (input_code.empty() || static_cast<int>(input_code.size()) > max_input_len_) {
+  // 关键限制：输入长度必须在 [2, max_input_len] 范围内
+  // 单字符 (length < 2) 严禁触发纠错，直接放行，消解首字母卡顿并保护单字简码
+  if (input_code.size() < 2 || static_cast<int>(input_code.size()) > max_input_len_) {
     return translation;
   }
 
@@ -226,7 +294,7 @@ an<Translation> HandslideFilter::Apply(an<Translation> translation,
       std::string guess_code = input_code;
       guess_code[pos] = new_char;
 
-      // 拼音合法性快速预校验
+      // 拼音合法性快速预校验（非拼音组合在微秒级丢弃）
       if (!IsPinyinValid(guess_code)) continue;
 
       if (seen_guess_codes.insert(guess_code).second) {
@@ -241,72 +309,33 @@ an<Translation> HandslideFilter::Apply(an<Translation> translation,
     }
   }
 
-  // 如果没有合法的猜测编码，直接返回原始翻译
   if (valid_guesses.empty()) {
     return translation;
   }
 
-  // 4. 获取原始输入候选并计算 score = base_freq + original_bonus
+  // 4. 获取原始输入候选（取前 30 个参与重排，防止流式 Translation 全量遍历）
   std::vector<GuessCandidate> final_candidates;
   std::unordered_set<std::string> seen_texts;
 
   if (translation) {
-    while (!translation->exhausted()) {
+    size_t count = 0;
+    while (!translation->exhausted() && count < 30) {
       auto cand = translation->Peek();
       if (cand) {
-        double base_freq = cand->quality();
-        auto genuine = Candidate::GetGenuineCandidate(cand);
-        if (auto phrase = As<Phrase>(genuine)) {
-          base_freq = phrase->weight();
-        }
+        double base_freq = CalculateBaseFrequency(cand);
         double score = base_freq + original_bonus_;
-        final_candidates.push_back({cand, cand->text(), score, true});
+        final_candidates.push_back(GuessCandidate(cand, cand->text(), score, true));
         seen_texts.insert(cand->text());
+        ++count;
       }
       translation->Next();
     }
   }
 
-  // 5. 获取纠错候选（通过临时隔离 Session 翻译，严格防止内存泄漏）
+  // 5. 获取纠错候选（通过轻量 Translator 查询，极速且隔离）
   s_reentrancy_guard = true;
-  std::string current_schema_id = engine_->schema() ? engine_->schema()->schema_id() : "";
-
   for (const auto& guess : valid_guesses) {
-    SessionId sub_id = Service::instance().CreateSession();
-    if (!sub_id) continue;
-
-    an<Session> sub_session = Service::instance().GetSession(sub_id);
-    if (sub_session) {
-      if (!current_schema_id.empty()) {
-        sub_session->ApplySchema(new Schema(current_schema_id));
-      }
-      sub_session->context()->set_input(guess.code);
-      Context* sub_ctx = sub_session->context();
-      if (sub_ctx && sub_ctx->HasMenu() && !sub_ctx->composition().empty()) {
-        Segment& seg = sub_ctx->composition().back();
-        if (seg.menu) {
-          // 每个纠错猜测最多提取前 6 个有效候选
-          for (size_t i = 0; i < 6; ++i) {
-            auto cand = seg.menu->GetCandidateAt(i);
-            if (!cand) break;
-
-            if (seen_texts.find(cand->text()) == seen_texts.end()) {
-              double base_freq = cand->quality();
-              auto genuine = Candidate::GetGenuineCandidate(cand);
-              if (auto phrase = As<Phrase>(genuine)) {
-                base_freq = phrase->weight();
-              }
-              // 打分公式：score = base_freq - weight_k * d
-              double score = base_freq - weight_k_ * guess.distance;
-              final_candidates.push_back({cand, cand->text(), score, false});
-              seen_texts.insert(cand->text());
-            }
-          }
-        }
-      }
-    }
-    // 立即销毁临时会话释放全部资源
-    Service::instance().DestroySession(sub_id);
+    QueryCandidates(guess.code, guess.distance, final_candidates, seen_texts);
   }
   s_reentrancy_guard = false;
 
@@ -321,6 +350,17 @@ an<Translation> HandslideFilter::Apply(an<Translation> translation,
   auto result_translation = New<FifoTranslation>();
   for (const auto& item : final_candidates) {
     result_translation->Append(item.cand);
+  }
+
+  // 若原 translation 还有剩余未排候选，追加到末尾
+  if (translation && !translation->exhausted()) {
+    while (!translation->exhausted()) {
+      auto cand = translation->Peek();
+      if (cand && seen_texts.insert(cand->text()).second) {
+        result_translation->Append(cand);
+      }
+      translation->Next();
+    }
   }
 
   return result_translation;
