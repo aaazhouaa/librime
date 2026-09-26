@@ -15,6 +15,7 @@
 #include <rime/gear/echo_translator.h>
 #include <rime/gear/editor.h>
 #include <rime/gear/fallback_segmentor.h>
+#include <rime/gear/handslide_filter.h>
 #include <rime/gear/history_translator.h>
 #include <rime/gear/key_binder.h>
 #include <rime/gear/matcher.h>
@@ -88,6 +89,7 @@ static void rime_gears_initialize() {
   r.Register("cjk_minifier", new Component<CharsetFilter>);  // alias
   r.Register("reverse_lookup_filter", new Component<ReverseLookupFilter>);
   r.Register("single_char_filter", new Component<SingleCharFilter>);
+  r.Register("handslide_filter", new Component<HandslideFilter>);
 
   // formatters
   r.Register("shape_formatter", new Component<ShapeFormatter>);
