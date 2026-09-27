@@ -346,32 +346,6 @@ void ConcreteEngine::InitializeComponents() {
                                        "translator", translators_);
   CreateComponentsFromList<Filter>(this, config, "engine/filters", "filter",
                                    filters_);
-  // 触屏 QWERTY 手滑纠错：若 schema 未显式挂载且未显式关闭，自动在 uniquifier 之前挂载
-  bool has_handslide = false;
-  for (const auto& f : filters_) {
-    if (f && f->name_space() == "handslide_filter") {
-      has_handslide = true;
-      break;
-    }
-  }
-  if (!has_handslide) {
-    bool enable_handslide = true;
-    if (!(config->GetBool("handslide/enable", &enable_handslide) && !enable_handslide)) {
-      if (auto c_filter = Filter::Require("handslide_filter")) {
-        Ticket ticket(this, "handslide_filter");
-        if (Filter* f = c_filter->Create(ticket)) {
-          auto it = filters_.end();
-          for (auto iter = filters_.begin(); iter != filters_.end(); ++iter) {
-            if ((*iter)->name_space() == "uniquifier") {
-              it = iter;
-              break;
-            }
-          }
-          filters_.insert(it, of<Filter>(f));
-        }
-      }
-    }
-  }
   // create formatters
   auto c_formatter = Formatter::Require("shape_formatter");
   if (c_formatter) {
