@@ -135,8 +135,17 @@ int Syllabifier::BuildSyllableGraph(const string& input,
         exact_match_syllables.insert(m.value);
       }
       Corrections corrections;
-      corrector_->ToleranceSearch(prism, string{current_input}, &corrections,
-                                  5);
+      // 邻键纠错只对单个音节有意义（最长音节即 prism 的最长 key 长度）。
+      // 但 current_input 是「当前位置到结尾的整个后缀」，越长容错 BFS 越久，
+      // 且每个音节图顶点都调一次 → 长串整体 O(n²)。这里把搜索 key 截断到
+      // max_key_length：更长的尾串不可能匹配任何音节，截断不影响纠错结果，
+      // 只消除长尾空转。首个/中间音节照常纠错，不受影响。
+      const size_t max_key_len = prism.max_key_length();
+      const size_t search_len =
+          max_key_len > 0 ? (std::min)(current_input.length(), max_key_len)
+                          : current_input.length();
+      corrector_->ToleranceSearch(prism, string(current_input.substr(0, search_len)),
+                                  &corrections, 5);
       for (const auto& m : corrections) {
         for (auto accessor = prism.QuerySpelling(m.first);
              !accessor.exhausted(); accessor.Next()) {
