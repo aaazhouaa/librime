@@ -28,6 +28,31 @@ using VertexQueue =
 const double kCompletionPenalty = -2.995732273553991;      // log(0.05)
 const double kCorrectionCredibility = -4.605170185988091;  // log(0.01)
 
+// 邻键纠错允许的「邻键替换字符数」上限（传给 Corrector::ToleranceSearch 的第 4 实参）。
+//
+// 上游取 5，配合其仅含同行左右的平均扇出 1.77 的窄邻键表。本项目邻键表已按触屏
+// QWERTY 真实交错坐标扩到扇出 4.77（见 dict/corrector.cc），二者不可再搭配使用：
+// 实测（scripts/neighbor/sim_corrector.py 复现 NearSearchCorrector 的 BFS）：
+//
+//   key       上游表 tol=5   扩表 tol=5   扩表 tol=2   扩表 tol=1
+//   zhang          164       11045         616           82
+//   xian            84        1086         246           49
+//   shuang         709        ---         1136          122
+//
+// 即「扩表 + tol=5」会把单音节搜索节点数抬高两个数量级（拼音最长 6 字符，
+// 每个字几乎任意误按组合都能命中合法音节），既慢又噪声最大，因此必须同步收紧。
+//
+// 取 1：单音节内允许 1 处邻键误按。
+//   - 覆盖用户实际反馈的全部单点误按：同行、斜向、垂直（如 de←dr / dai←eai / ni←nk）；
+//   - 节点数 122（shuang），反而比当前上游 tol=5 的 709 快约 5.8 倍，无性能回归；
+//   - 噪声最小：不允许同一音节内两处同时“猜”，而多音节输入仍按音节各自计数，
+//     整串层面仍容许每音节一处误按。
+// 若日后确认需要「同一音节内两处误按」也可纠，改回 2 即可（代价见上表）。
+//
+// 命名避开 threshold：corrector.cc 已有两处同名参数，语义分别是邻键替换上限与
+// 加权编辑距离上限（后者在 #if 0 死代码中）。
+const size_t kCorrectionMaxSubstitutions = 1;
+
 // ── T9 增量音节图缓存：正确性要点（见 syllabifier.h 的 SyllableGraphCache）──
 // 1. 图构建分四段，均为确定性的纯函数：BFS → 剪枝 → 补全 → Transpose。
 //    缓存保存 BFS 段的输出（剪枝前），追加数字时在缓存图上续跑 BFS，
@@ -145,7 +170,7 @@ int Syllabifier::BuildSyllableGraph(const string& input,
           max_key_len > 0 ? (std::min)(current_input.length(), max_key_len)
                           : current_input.length();
       corrector_->ToleranceSearch(prism, string(current_input.substr(0, search_len)),
-                                  &corrections, 5);
+                                  &corrections, kCorrectionMaxSubstitutions);
       for (const auto& m : corrections) {
         for (auto accessor = prism.QuerySpelling(m.first);
              !accessor.exhausted(); accessor.Next()) {
