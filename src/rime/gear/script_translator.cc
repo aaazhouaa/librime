@@ -204,10 +204,9 @@ class ScriptTranslation : public Translation {
   UserDictEntryCollector::reverse_iterator user_phrase_iter_;
 
   // 纠错候选产出上限：整条候选流最多保留这么多条 is_correction 候选，
-  // 超出的被 Next() 丢弃（注意计数只对纠错候选累加）。上游取 4；
-  // 邻键表按触屏坐标扩表后纠错命中面变宽，收紧到 2 以降低噪声候选占比。
+  // 超出的被 Next() 丢弃（注意计数只对纠错候选累加）。取上游默认值 4。
   // 仅对 enable_correction 为真的方案生效（九键已显式关闭，不受影响）。
-  const size_t max_corrections_ = 2;
+  const size_t max_corrections_ = 4;
   size_t correction_count_ = 0;
   int max_sentences_ = 1;
   double sentence_cutoff_threshold_ = 0.1;
