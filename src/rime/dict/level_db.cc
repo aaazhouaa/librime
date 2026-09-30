@@ -16,6 +16,17 @@ namespace rime {
 
 static const char* kMetaCharacter = "\x01";
 
+// 写入必须同步落盘。leveldb 的 WriteOptions 默认 sync=false，此时 Put 只把
+// 数据写进进程内的 memtable，只有 memtable 攒满（默认 4MB）或显式 flush 才
+// 生成 .sst。Android 会在应用切后台后随时杀进程，而杀进程不会走 leveldb 的
+// Close/flush，未落盘的写全部随进程蒸发：用户词典调频表现为「选过的词下次
+// 还是不记得」，攒很久后才突然生效。上屏选词频率很低，fsync 代价可接受。
+static const leveldb::WriteOptions kSyncedWrite = [] {
+  leveldb::WriteOptions options;
+  options.sync = true;
+  return options;
+}();
+
 struct LevelDbCursor {
   leveldb::Iterator* iterator = nullptr;
 
@@ -74,7 +85,7 @@ struct LevelDbWrapper {
       batch.Put(key, value);
       return true;
     }
-    auto status = ptr->Put(leveldb::WriteOptions(), key, value);
+    auto status = ptr->Put(kSyncedWrite, key, value);
     return status.ok();
   }
 
@@ -83,14 +94,14 @@ struct LevelDbWrapper {
       batch.Delete(key);
       return true;
     }
-    auto status = ptr->Delete(leveldb::WriteOptions(), key);
+    auto status = ptr->Delete(kSyncedWrite, key);
     return status.ok();
   }
 
   void ClearBatch() { batch.Clear(); }
 
   bool CommitBatch() {
-    auto status = ptr->Write(leveldb::WriteOptions(), &batch);
+    auto status = ptr->Write(kSyncedWrite, &batch);
     return status.ok();
   }
 };
